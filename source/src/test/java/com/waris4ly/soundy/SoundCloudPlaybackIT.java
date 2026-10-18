@@ -74,6 +74,50 @@ class SoundCloudPlaybackIT {
     }
 
     @Test
+    void seekSurvivesSegmentRestart() throws Exception {
+        AudioPlayerManager manager = new DefaultAudioPlayerManager();
+        manager.registerSourceManager(new SoundySourceManager());
+
+        CompletableFuture<AudioItem> loaded = new CompletableFuture<>();
+        manager.loadItem(new AudioReference(TRACK_URL, null), resultHandler(loaded));
+        AudioItem item = loaded.get(60, TimeUnit.SECONDS);
+        assertTrue(item instanceof AudioTrack, "expected a track, got: " + item.getClass());
+
+        AudioPlayer player = manager.createPlayer();
+        AudioTrack track = (AudioTrack) item;
+        track.setPosition(100); // let a few frames decode first
+        player.playTrack(track);
+
+        long frames = 0;
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
+        while (frames < 10 && System.currentTimeMillis() < deadline) {
+            if (player.provide() != null) frames++; else Thread.sleep(5);
+        }
+
+        track.setPosition(TimeUnit.SECONDS.toMillis(150));
+
+        long framesAfterSeek = 0;
+        long maxPosition = 0;
+        deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(60);
+        while (framesAfterSeek < 50 && System.currentTimeMillis() < deadline) {
+            if (player.provide() != null) {
+                framesAfterSeek++;
+                maxPosition = Math.max(maxPosition, track.getPosition());
+            } else {
+                Thread.sleep(5);
+            }
+        }
+
+        player.stopTrack();
+        manager.shutdown();
+
+        assertTrue(framesAfterSeek >= 50,
+                "expected frames to continue after seek, got " + framesAfterSeek);
+        assertTrue(maxPosition >= TimeUnit.SECONDS.toMillis(149),
+                "position after seek should be >= 149s, was " + maxPosition + "ms");
+    }
+
+    @Test
     void searchesSoundCloud() throws Exception {
         AudioPlayerManager manager = new DefaultAudioPlayerManager();
         manager.registerSourceManager(new SoundySourceManager());

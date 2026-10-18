@@ -1,8 +1,13 @@
 package com.waris4ly.soundy;
 
-import com.sedmelluq.discord.lavaplayer.container.mpeg.MpegAudioTrack;
+import com.sedmelluq.discord.lavaplayer.container.mpeg.MpegAacTrackConsumer;
+import com.sedmelluq.discord.lavaplayer.container.mpeg.MpegFileLoader;
+import com.sedmelluq.discord.lavaplayer.container.mpeg.reader.MpegFileTrackProvider;
+import com.sedmelluq.discord.lavaplayer.container.mpeg.MpegTrackConsumer;
+import com.sedmelluq.discord.lavaplayer.container.mpeg.MpegTrackInfo;
 import com.sedmelluq.discord.lavaplayer.container.mp3.Mp3AudioTrack;
 import com.sedmelluq.discord.lavaplayer.source.AudioSourceManager;
+import com.sedmelluq.discord.lavaplayer.tools.FriendlyException;
 import com.sedmelluq.discord.lavaplayer.tools.http.HttpStreamTools;
 import com.sedmelluq.discord.lavaplayer.tools.io.ChainedInputStream;
 import com.sedmelluq.discord.lavaplayer.tools.io.HttpInterface;
@@ -12,11 +17,15 @@ import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.DelegatedAudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.playback.LocalAudioTrackExecutor;
 import org.apache.http.client.methods.HttpGet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.InputStream;
 import java.net.URI;
+import java.util.List;
 
 public class SoundyAudioTrack extends DelegatedAudioTrack {
+    private static final Logger log = LoggerFactory.getLogger(SoundyAudioTrack.class);
 
     private final SoundySourceManager sourceManager;
 
@@ -35,6 +44,8 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
         try (HttpInterface http = sourceManager.getHttpInterface()) {
             stream = sourceManager.getService().getStream(http, info.getTrackId());
         }
+        log.info("Track {} resolved to {} stream ({})", info.getTrackId(),
+                stream.getProtocol(), stream.getMimeType());
 
         if (stream.getProtocol() == StreamData.Protocol.PROGRESSIVE) {
             processProgressive(stream, executor);
@@ -56,22 +67,25 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
      * SoundCloud's remaining format is fragmented-MP4 HLS: a media playlist whose
      * EXT-X-MAP init segment (ftyp + moov) is followed by moof + mdat fragments.
      * Concatenated in playlist order they form a regular fragmented MP4 stream,
-     * which lavaplayer's MpegAudioTrack decodes.
+     * which lavaplayer's MPEG container reader decodes.
      *
-     * Seeking is not supported: the playlist carries no sidx box, so the fragmented
-     * MP4 reader has no seek index and ignores seek requests.
+     * Seeking restarts the stream at the segment containing the target position
+     * (mapped via cumulative EXTINF durations); MP4 fragment timecodes are
+     * absolute, so position reporting stays correct.
      */
     private void processHlsFmp4(StreamData stream, LocalAudioTrackExecutor executor) throws Exception {
         try (HttpInterface httpInterface = sourceManager.getHttpInterface()) {
             SoundyHlsPlaylistParser.Playlist playlist = SoundyHlsPlaylistParser.parse(
                     httpInterface, new URI(stream.getUrl()));
+            log.info("Parsed HLS playlist for track {}: init segment present = {}, {} segments",
+                    trackInfo.identifier, playlist.initUrl != null, playlist.segments.size());
 
-            ChainedInputStream chainedStream = new ChainedInputStream(
-                    new Fmp4StreamProvider(httpInterface, playlist));
-
-            processDelegate(
-                    new MpegAudioTrack(trackInfo, new NonSeekableInputStream(chainedStream)),
-                    executor);
+            Fmp4Player player = new Fmp4Player(httpInterface, playlist, executor);
+            try {
+                executor.executeProcessingLoop(player::provideFrames, player::performSeek, true);
+            } finally {
+                player.close();
+            }
         }
     }
 
@@ -86,17 +100,131 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
     }
 
     /**
-     * Serves the init segment first, then the media segments in playlist order.
-     * Returning null terminates the chained stream.
+     * Drives lavaplayer's MPEG container reader over the chained init+segment
+     * stream and rebuilds that chain on seek.
+     */
+    private class Fmp4Player {
+        private final HttpInterface httpInterface;
+        private final SoundyHlsPlaylistParser.Playlist playlist;
+        private final LocalAudioTrackExecutor executor;
+
+        private ChainedInputStream chain;
+        private MpegTrackConsumer consumer;
+        private MpegFileTrackProvider reader;
+
+        private Fmp4Player(HttpInterface httpInterface,
+                           SoundyHlsPlaylistParser.Playlist playlist,
+                           LocalAudioTrackExecutor executor) {
+            this.httpInterface = httpInterface;
+            this.playlist = playlist;
+            this.executor = executor;
+        }
+
+        private void provideFrames() throws Exception {
+            ensureOpened();
+            reader.provideFrames();
+        }
+
+        private void performSeek(long positionMs) throws Exception {
+            log.debug("Seeking track {} to {} ms", trackInfo.identifier, positionMs);
+            openChain(segmentIndexFor(positionMs));
+        }
+
+        private void ensureOpened() throws Exception {
+            if (reader == null) {
+                openChain(0);
+            }
+        }
+
+        private void openChain(int segmentIndex) throws Exception {
+            closeChain();
+
+            if (playlist.initUrl == null) {
+                throw new FriendlyException("HLS playlist has no EXT-X-MAP init segment.",
+                        FriendlyException.Severity.SUSPICIOUS, null);
+            }
+
+            chain = new ChainedInputStream(
+                    new Fmp4StreamProvider(httpInterface, playlist, segmentIndex));
+
+            MpegFileLoader loader = new MpegFileLoader(new NonSeekableInputStream(chain));
+            loader.parseHeaders();
+
+            consumer = selectAudioTrack(loader.getTrackList());
+            if (consumer == null) {
+                throw new FriendlyException("No supported audio track in SoundCloud stream.",
+                        FriendlyException.Severity.SUSPICIOUS, null);
+            }
+            consumer.initialise();
+
+            reader = loader.loadReader(consumer);
+            if (reader == null) {
+                throw new FriendlyException("Unknown MP4 format.", FriendlyException.Severity.SUSPICIOUS, null);
+            }
+        }
+
+        private MpegTrackConsumer selectAudioTrack(List<MpegTrackInfo> tracks) {
+            for (MpegTrackInfo track : tracks) {
+                if ("soun".equals(track.handler) && "mp4a".equals(track.codecName)) {
+                    log.debug("Starting to play track with codec {}", track.codecName);
+                    return new MpegAacTrackConsumer(executor.getProcessingContext(), track);
+                }
+            }
+            return null;
+        }
+
+        private int segmentIndexFor(long positionMs) {
+            long cumulativeMs = 0;
+            List<SoundyHlsPlaylistParser.Segment> segments = playlist.segments;
+
+            for (int i = 0; i < segments.size(); i++) {
+                Long duration = segments.get(i).durationMs;
+                if (duration == null) {
+                    // Without a duration we cannot map positions any further.
+                    return i;
+                }
+                cumulativeMs += duration;
+                if (positionMs < cumulativeMs) {
+                    return i;
+                }
+            }
+            return segments.size();
+        }
+
+        private void closeChain() {
+            if (consumer != null) {
+                try {
+                    consumer.close();
+                } catch (Exception e) {
+                    log.debug("Failed to close track consumer.", e);
+                }
+                consumer = null;
+            }
+            reader = null;
+            chain = null;
+        }
+
+        private void close() {
+            closeChain();
+        }
+    }
+
+    /**
+     * Serves the init segment first, then the media segments in playlist order
+     * starting from the given index. Returning null terminates the chained stream.
      */
     private static class Fmp4StreamProvider implements ChainedInputStream.Provider {
         private final HttpInterface httpInterface;
         private final SoundyHlsPlaylistParser.Playlist playlist;
+        private final int startSegment;
         private int position = 0;
 
-        private Fmp4StreamProvider(HttpInterface httpInterface, SoundyHlsPlaylistParser.Playlist playlist) {
+        private Fmp4StreamProvider(HttpInterface httpInterface,
+                                   SoundyHlsPlaylistParser.Playlist playlist,
+                                   int startSegment) {
             this.httpInterface = httpInterface;
             this.playlist = playlist;
+            this.startSegment = startSegment;
         }
 
         @Override
@@ -104,10 +232,12 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
             String url;
             if (position == 0) {
                 url = playlist.initUrl;
-            } else if (position <= playlist.segments.size()) {
-                url = playlist.segments.get(position - 1).url;
             } else {
-                return null;
+                int segment = startSegment + position - 1;
+                if (segment >= playlist.segments.size()) {
+                    return null;
+                }
+                url = playlist.segments.get(segment).url;
             }
 
             position++;
