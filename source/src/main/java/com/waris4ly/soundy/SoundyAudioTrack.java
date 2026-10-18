@@ -20,9 +20,15 @@ import org.apache.http.client.methods.HttpGet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class SoundyAudioTrack extends DelegatedAudioTrack {
     private static final Logger log = LoggerFactory.getLogger(SoundyAudioTrack.class);
@@ -111,6 +117,7 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
         private ChainedInputStream chain;
         private MpegTrackConsumer consumer;
         private MpegFileTrackProvider reader;
+        private Fmp4StreamProvider provider;
 
         private Fmp4Player(HttpInterface httpInterface,
                            SoundyHlsPlaylistParser.Playlist playlist,
@@ -156,8 +163,8 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
                         FriendlyException.Severity.SUSPICIOUS, null);
             }
 
-            chain = new ChainedInputStream(
-                    new Fmp4StreamProvider(httpInterface, playlist, segmentIndex));
+            provider = new Fmp4StreamProvider(sourceManager, playlist, segmentIndex);
+            chain = new ChainedInputStream(provider);
 
             MpegFileLoader loader = new MpegFileLoader(new NonSeekableInputStream(chain));
             loader.parseHeaders();
@@ -204,6 +211,10 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
         }
 
         private void closeChain() {
+            if (provider != null) {
+                provider.close();
+                provider = null;
+            }
             if (consumer != null) {
                 try {
                     consumer.close();
@@ -223,37 +234,90 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
 
     /**
      * Serves the init segment first, then the media segments in playlist order
-     * starting from the given index. Returning null terminates the chained stream.
+     * starting from the given index, fully buffered. While one resource plays,
+     * the next one is prefetched on a background thread so segment boundaries
+     * do not stall playback. Returning null terminates the chained stream.
      */
-    private static class Fmp4StreamProvider implements ChainedInputStream.Provider {
-        private final HttpInterface httpInterface;
+    private static class Fmp4StreamProvider implements ChainedInputStream.Provider, AutoCloseable {
+        private final SoundySourceManager sourceManager;
         private final SoundyHlsPlaylistParser.Playlist playlist;
         private final int startSegment;
-        private int position = 0;
+        private final ExecutorService prefetchExecutor;
 
-        private Fmp4StreamProvider(HttpInterface httpInterface,
+        private int cursor = 0;
+        private Future<byte[]> pending;
+
+        private Fmp4StreamProvider(SoundySourceManager sourceManager,
                                    SoundyHlsPlaylistParser.Playlist playlist,
                                    int startSegment) {
-            this.httpInterface = httpInterface;
+            this.sourceManager = sourceManager;
             this.playlist = playlist;
             this.startSegment = startSegment;
+            this.prefetchExecutor = Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "soundy-prefetch");
+                thread.setDaemon(true);
+                return thread;
+            });
         }
 
         @Override
-        public InputStream next() {
-            String url;
-            if (position == 0) {
-                url = playlist.initUrl;
-            } else {
-                int segment = startSegment + position - 1;
-                if (segment >= playlist.segments.size()) {
-                    return null;
-                }
-                url = playlist.segments.get(segment).url;
+        public InputStream next() throws IOException {
+            String url = urlFor(cursor);
+            if (url == null) {
+                return null;
             }
 
-            position++;
-            return HttpStreamTools.streamContent(httpInterface, new HttpGet(url));
+            byte[] data;
+            Future<byte[]> prefetched = pending;
+            pending = null;
+
+            if (prefetched != null) {
+                try {
+                    data = prefetched.get();
+                } catch (ExecutionException e) {
+                    throw new IOException("Prefetch failed for " + url, e.getCause());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Prefetch interrupted", e);
+                }
+            } else {
+                data = fetch(url);
+            }
+
+            cursor++;
+
+            String upcoming = urlFor(cursor);
+            if (upcoming != null) {
+                pending = prefetchExecutor.submit(() -> fetch(upcoming));
+            }
+
+            return new ByteArrayInputStream(data);
+        }
+
+        private String urlFor(int index) {
+            if (index == 0) {
+                return playlist.initUrl;
+            }
+            int segment = startSegment + index - 1;
+            if (segment >= playlist.segments.size()) {
+                return null;
+            }
+            return playlist.segments.get(segment).url;
+        }
+
+        private byte[] fetch(String url) throws IOException {
+            // A thread-local interface per fetch thread; the response is fully
+            // buffered before the interface is closed.
+            try (HttpInterface http = sourceManager.getHttpInterface()) {
+                try (InputStream stream = HttpStreamTools.streamContent(http, new HttpGet(url))) {
+                    return stream.readAllBytes();
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            prefetchExecutor.shutdownNow();
         }
     }
 }
