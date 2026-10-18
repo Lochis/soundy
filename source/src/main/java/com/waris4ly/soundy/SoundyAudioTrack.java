@@ -126,8 +126,20 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
         }
 
         private void performSeek(long positionMs) throws Exception {
-            log.debug("Seeking track {} to {} ms", trackInfo.identifier, positionMs);
-            openChain(segmentIndexFor(positionMs));
+            long duration = trackInfo.length;
+            long clamped = Math.max(0, positionMs);
+
+            // Some clients send bogus positions on play (e.g. VoiceLink forwards the
+            // track identifier). Seeking past the end would open a chain that EOFs
+            // immediately, so out-of-range seeks fall back to the track start.
+            if (duration > 0 && clamped >= duration) {
+                log.warn("Track {}: clamping out-of-range seek {} ms (duration {} ms) to start",
+                        trackInfo.identifier, positionMs, duration);
+                clamped = 0;
+            }
+
+            log.debug("Seeking track {} to {} ms", trackInfo.identifier, clamped);
+            openChain(segmentIndexFor(clamped));
         }
 
         private void ensureOpened() throws Exception {
