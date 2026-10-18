@@ -187,15 +187,16 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
             }
 
             log.debug("Seeking track {} to {} ms", trackInfo.identifier, clamped);
-            openChain(segmentIndexFor(playlist.segments, clamped));
+            openChain(segmentIndexFor(playlist.segments, clamped), clamped);
         }
 
         private void ensureOpened() throws Exception {
             if (reader == null) {
-                openChain(0);
+                openChain(0, 0);
             }
         }
-        private void openChain(int segmentIndex) throws Exception {
+
+        private void openChain(int segmentIndex, long positionMs) throws Exception {
             closeChain();
 
             if (playlist.initUrl == null) {
@@ -215,6 +216,15 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
                         FriendlyException.Severity.SUSPICIOUS, null);
             }
             consumer.initialise();
+
+            // The fragmented provider only reports absolute fragment timecodes
+            // via seekPerformed when it has a seek index (sidx); SoundCloud
+            // playlists carry none. Seed the consumer with the chain's start
+            // position so the output pipeline does not restart its timecode at
+            // zero, which made clients' progress displays rewind after seeks.
+            long segmentStartMs = totalDurationMs(
+                    playlist.segments.subList(0, Math.min(segmentIndex, playlist.segments.size())));
+            consumer.seekPerformed(positionMs, segmentStartMs);
 
             reader = loader.loadReader(consumer);
             if (reader == null) {
