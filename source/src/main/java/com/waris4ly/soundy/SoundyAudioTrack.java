@@ -106,6 +106,44 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
     }
 
     /**
+     * Maps a position to the segment containing it. Positions beyond the last
+     * known duration land on the last segment (play the tail) rather than past
+     * the end, which would open an init-only chain that EOFs immediately.
+     */
+    static int segmentIndexFor(List<SoundyHlsPlaylistParser.Segment> segments, long positionMs) {
+        if (segments.isEmpty()) {
+            return 0;
+        }
+
+        long cumulativeMs = 0;
+        for (int i = 0; i < segments.size(); i++) {
+            Long duration = segments.get(i).durationMs;
+            if (duration == null) {
+                // Without a duration we cannot map positions any further.
+                return i;
+            }
+            cumulativeMs += duration;
+            if (positionMs < cumulativeMs) {
+                return i;
+            }
+        }
+        return segments.size() - 1;
+    }
+
+    /**
+     * Sums the known EXTINF durations; unknown durations count as zero.
+     */
+    static long totalDurationMs(List<SoundyHlsPlaylistParser.Segment> segments) {
+        long totalMs = 0;
+        for (SoundyHlsPlaylistParser.Segment segment : segments) {
+            if (segment.durationMs != null) {
+                totalMs += segment.durationMs;
+            }
+        }
+        return totalMs;
+    }
+
+    /**
      * Drives lavaplayer's MPEG container reader over the chained init+segment
      * stream and rebuilds that chain on seek.
      */
@@ -139,14 +177,17 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
             // Some clients send bogus positions on play (e.g. VoiceLink forwards the
             // track identifier). Seeking past the end would open a chain that EOFs
             // immediately, so out-of-range seeks fall back to the track start.
-            if (duration > 0 && clamped >= duration) {
+            long effectiveEnd = duration > 0
+                    ? duration
+                    : totalDurationMs(playlist.segments);
+            if (effectiveEnd > 0 && clamped >= effectiveEnd) {
                 log.warn("Track {}: clamping out-of-range seek {} ms (duration {} ms) to start",
-                        trackInfo.identifier, positionMs, duration);
+                        trackInfo.identifier, positionMs, effectiveEnd);
                 clamped = 0;
             }
 
             log.debug("Seeking track {} to {} ms", trackInfo.identifier, clamped);
-            openChain(segmentIndexFor(clamped));
+            openChain(segmentIndexFor(playlist.segments, clamped));
         }
 
         private void ensureOpened() throws Exception {
@@ -154,7 +195,6 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
                 openChain(0);
             }
         }
-
         private void openChain(int segmentIndex) throws Exception {
             closeChain();
 
@@ -190,24 +230,6 @@ public class SoundyAudioTrack extends DelegatedAudioTrack {
                 }
             }
             return null;
-        }
-
-        private int segmentIndexFor(long positionMs) {
-            long cumulativeMs = 0;
-            List<SoundyHlsPlaylistParser.Segment> segments = playlist.segments;
-
-            for (int i = 0; i < segments.size(); i++) {
-                Long duration = segments.get(i).durationMs;
-                if (duration == null) {
-                    // Without a duration we cannot map positions any further.
-                    return i;
-                }
-                cumulativeMs += duration;
-                if (positionMs < cumulativeMs) {
-                    return i;
-                }
-            }
-            return segments.size();
         }
 
         private void closeChain() {
