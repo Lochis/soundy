@@ -27,7 +27,7 @@ Drop the jar into your Lavalink `plugins/` folder.
 ```
 lavalink/
 └── plugins/
-    └── soundy-plugin-1.0.0.jar
+    └── soundy-plugin-1.1.0.jar
 ```
 
 Then declare it in your `application.yml`:
@@ -35,7 +35,7 @@ Then declare it in your `application.yml`:
 ```yaml
 lavalink:
   plugins:
-    - dependency: "com.waris4ly.soundy:plugin:1.0.0"
+    - dependency: "com.waris4ly.soundy:plugin:1.1.0"
       repository: "https://maven.lavalink.dev/releases"
 ```
 
@@ -59,7 +59,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.waris4ly.soundy:common:1.0.0")
+    implementation("com.waris4ly.soundy:common:1.1.0")
 }
 ```
 
@@ -124,5 +124,5 @@ https://soundcloud.com/someuser/sets/some-playlist
 Output:
 
 ```
-plugin/build/libs/soundy-plugin-1.0.0.jar
+plugin/build/libs/soundy-plugin-1.1.0.jar
 ```
