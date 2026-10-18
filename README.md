@@ -2,6 +2,15 @@
 
 A SoundCloud source plugin for [Lavalink](https://github.com/lavalink-devs/Lavalink) built on [lavaplayer](https://github.com/lavalink-devs/lavaplayer).
 
+## Format support
+
+SoundCloud dropped progressive streams and the legacy HLS `audio/mpegurl`
+transcoding (its resolver now returns 404). soundy plays the only format
+SoundCloud still serves — fragmented-MP4 HLS (`audio/mp4`, AAC) — by streaming
+the `EXT-X-MAP` init segment and all media segments through lavaplayer's
+fragmented MP4 demuxer. Seeking within a track is currently not supported
+(the playlists carry no seek index).
+
 ## Table of Contents
 
 - [Plugin](#plugin)
